@@ -1,0 +1,455 @@
+---
+title: "Capstone Machine Learning"
+author: "Alexander Budiman"
+date: "7/21/2023"
+output: html_document
+---
+
+### Import Library
+```{r}
+library(dplyr)
+library(GGally)
+library(MLmetrics)
+library(recipes)
+library(yardstick)
+library(randomForest)
+library(lime)
+library(caret)
+```
+
+### Read Data
+```{r}
+train <- read.csv("data-train.csv")
+test <- read.csv("data-test.csv")
+submit <- read.csv("submission-example.csv")
+glimpse(train)
+```
+
+### Data Preprocessing & Exploratory Data Analysis
+1. Memeriksa apakah ada kolom yang kosong datanya.
+```{r}
+train %>% 
+   is.na() %>% 
+  colSums(is.na(train))
+```
+
+2. Menghilangkan kolom id
+```{r}
+train <- train[,-1]
+head(train)
+```
+
+3. Melihat Outlier
+
+A. Pada kolom cement tidak terdapat outlier
+```{r}
+boxplot(train$cement)
+```
+
+B. Pada kolom slag terdapat outlier
+```{r}
+boxplot(train$slag)
+```
+```{r}
+sort(boxplot(train$slag, plot = F)$out)
+```
+
+C. Pada kolom flyash tidak terdapat outlier
+```{r}
+boxplot(train$flyash)
+```
+
+D. Pada kolom water terdapat outlier
+```{r}
+boxplot(train$water)
+```
+
+```{r}
+sort(boxplot(train$water, plot = F)$out)
+```
+
+E. Pada kolom super_plast terdapat outlier
+```{r}
+boxplot(train$super_plast)
+```
+
+```{r}
+sort(boxplot(train$super_plast, plot = F)$out)
+```
+F. Pada kolom coarse_agg tidak terdapat outlier
+```{r}
+boxplot(train$coarse_agg)
+```
+
+G. Pada kolom fine_agg terdapat outlier
+```{r}
+boxplot(train$fine_agg)
+```
+
+```{r}
+sort(boxplot(train$fine_agg, plot = F)$out)
+```
+
+H. Pada kolom age terdapat outlier
+```{r}
+boxplot(train$age)
+```
+```{r}
+sort(boxplot(train$age, plot = F)$out)
+```
+
+I. Pada kolom strength terdapat outlier
+```{r}
+boxplot(train$strength)
+```
+
+
+```{r}
+sort(boxplot(train$strength, plot = F)$out)
+```
+
+Outlier di kolom strength saya putuskan untuk dihilangkan dengan mensubset data dimana kolom strength < 79.40
+```{r}
+train <- train %>% 
+          subset(strength < 79.40)
+```
+
+
+4. Melihat korelasi
+```{r}
+GGally::ggcorr(train, label = T)
+```
+
+```{r}
+GGally::ggpairs(train)
+```
+
+
+Nilai korelasi antara strength dan age adalah 0,342. Seperti yang sudah disebutkan  bahwa jumlah hari istirahat sebelum pengukuran berpengaruh terhadap kuat tekan beton.
+
+Nilai korelasi antara strength dan cement adalah 0,496. Berdasarkan teori kuat tekan beton sangat dipengaruhi oleh perbandingan semen dan air. Dan itu masuk akal jika  semen dan air adalah variabel yang mempengaruhi kekuatan beton.
+
+Jumlah super plast / peredam airpasti memiliki korelasi positif dengan strength dan juga memiliki korelasi negatif dengan water. Nilai korelasi dapat dilihat pada grafik di atas yaitu 0,362
+
+
+
+### Model Fitting & Evaluation
+Proporsi data  train vs data test adalah 80% untuk data train dan 20% untuk data test. Sebelum memprediksi data uji, akan dilakukan validasi silang pada data train untuk membagi 80% data train ke data training dan 20% data train ke data validasi. 
+
+1. Cross validation
+```{r}
+RNGkind(sample.kind = "Rounding")
+```
+
+```{r}
+set.seed(34)
+idx <- sample(nrow(train), nrow(train) * 0.8)
+data_train <- train[idx, ]
+data_validasi <- train[-idx, ]
+```
+
+2. Percobaan Kemungkinan Model
+
+A. Model 1: Simple Regression Model
+```{r}
+mod1 <- lm(formula = strength ~., data_train)
+mod1 <- stats::step(object = mod1, direction = "backward")
+```
+
+```{r}
+#predict di data train
+pred_mod1_train <- predict(mod1, newdata = data.frame(data_train)) 
+#predict di data validasi
+pred_mod1_validasi <- predict(mod1, newdata = data.frame(data_validasi)) 
+```
+
+
+```{r}
+#performance prediksi data train
+rbind(
+  "Data Train" = select(data_train, strength) %>%
+  mutate(
+    pred_lm = predict(mod1, data_train)
+  ) %>% 
+  summarise(
+    mae = mae_vec(truth = strength, estimate = pred_lm),
+    rsq = rsq_vec(truth = strength, estimate = pred_lm),
+  ),
+
+  #performance prediksi data validasi
+  "Data Validation" = select(data_validasi, strength) %>%
+  mutate(
+    pred_lm = predict(mod1, data_validasi)
+  ) %>% 
+  summarise(
+    mae = mae_vec(truth = strength, estimate = pred_lm),
+    rsq = rsq_vec(truth = strength, estimate = pred_lm),
+  )
+)
+```
+
+Didapat MAE > 4 dan R Square < 90 %, maka dari itu dicoba untuk scaling
+
+```{r}
+# Preprocess recipe train dataset
+rec <- recipe(strength ~ ., data = data_train) %>% 
+  step_sqrt(all_numeric()) %>%
+  step_center(all_numeric()) %>% 
+  step_scale(all_numeric()) %>% 
+  prep()
+
+# prepare recipes-revert functions
+rec_rev <- function(x, rec){
+
+  means <- rec$steps[[2]]$means[["strength"]]
+  sds <- rec$steps[[3]]$sds[["strength"]]
+
+  x <- (x * sds + means) ^ 2
+
+  x
+}
+
+# apply recipe to train data
+dat_train_scaled <- juice(rec)
+
+# apply recipe to test data
+dat_test_scaled <- bake(rec, data_validasi)
+
+#modeling with regression
+model_lm_scaled <- stats::step(lm(strength ~., data = dat_train_scaled), direction = "backward", trace = 0)
+
+#regression mode performance comparation with scaling and not scaling data
+rbind(
+  # performance with scaling
+ "Scaled" = select(data_validasi, strength) %>%
+  mutate(
+    pred_lm = predict(model_lm_scaled, dat_test_scaled),
+    pred_lm = rec_rev(pred_lm, rec)
+  ) %>% 
+  summarise(
+    mae = mae_vec(truth = strength, estimate = pred_lm),
+    rsq = rsq_vec(truth = strength, estimate = pred_lm),
+  ),
+  
+  # performance without scaling
+ "Not Scaled" = select(data_validasi, strength) %>%
+  mutate(
+    pred_lm = predict(mod1, data_validasi)
+  ) %>% 
+  summarise(
+    mae = mae_vec(truth = strength, estimate = pred_lm),
+    rsq = rsq_vec(truth = strength, estimate = pred_lm),
+  )
+)
+```
+
+Dari hasil didapat bahwa data yang di scaled memiliki MAE dan R square yang lebih baik dari sebelumnya. Model 1: Simple Regression belum baik, lalu dicoba model lain.
+
+
+B. Model 2: Linear Regression & Random Forest dengan penskalaan data/ Data Scaling
+```{r}
+set.seed(34)
+
+#modeling with random forest from package randomForest
+model_rf <- randomForest(formula =  strength ~ ., data = dat_train_scaled)
+```
+
+
+```{r}
+rbind(
+  # performance with linear regression model
+ "Regression" = select(data_validasi, strength) %>%
+  mutate(
+    pred_lm = predict(model_lm_scaled, dat_test_scaled),
+    pred_lm = rec_rev(pred_lm, rec)
+  ) %>% 
+  summarise(
+    mae = mae_vec(truth = strength, estimate = pred_lm),
+    rsq = rsq_vec(truth = strength, estimate = pred_lm),
+  ),
+  
+  # performance with random forest with package randomForest
+ "Random Forest" = select(data_validasi, strength) %>%
+  mutate(
+    pred_rf = predict(model_rf, dat_test_scaled),
+    pred_rf = rec_rev(pred_rf, rec)
+  ) %>% 
+  summarise(
+    mae = mae_vec(truth = strength, estimate = pred_rf),
+    rsq = rsq_vec(truth = strength, estimate = pred_rf),
+  )
+)
+```
+
+Dapat dilihat bahwa Random Forest memiliki MAE < 4 dan R Square > 90%. Model Terbaik adalah model: RANDOM FOREST
+
+```{r}
+#MODEL TERBAIK: RANDOM FOREST
+select(data_validasi, strength) %>%
+  mutate(
+    pred_rf = predict(model_rf, dat_test_scaled),
+    pred_rf = rec_rev(pred_rf, rec)
+  ) %>% 
+  summarise(
+    mae = mae_vec(truth = strength, estimate = pred_rf),
+    rsq = rsq_vec(truth = strength, estimate = pred_rf),
+  )
+```
+
+Diperoleh model Random Forest dengan MAE=3.49614 dan R-Square=0.9445154
+
+
+### Export Prediction
+```{r}
+# apply recipe to test data
+dat_test1_scaled <- bake(rec, test)
+
+#predict
+pred_test <- select(test, strength) %>%
+  mutate(
+    pred_rf = predict(model_rf, dat_test1_scaled),
+    pred_rf = rec_rev(pred_rf, rec)
+  )
+
+#get the value of prediction
+pred_rf <- pred_test$pred_rf
+
+#write submission
+result <- submit %>% mutate(strength = pred_rf)
+write.csv(result, file = "submission-alex.csv")
+```
+
+```{r}
+head(result)
+```
+
+
+### Interpretation With LIME
+```{r}
+varImp(model_rf)
+```
+
+
+```{r}
+explainer_caret <- lime(data_train, model_rf)
+
+class(explainer_caret)
+```
+
+```{r}
+model_type.randomForest <- function(x) {
+  return("regression")
+}
+
+predict_model.randomForest <- function(x, newdata, type="response") {
+  
+  res <- predict(x, newdata, type = "response") %>% as.data.frame()
+  
+  return(res)
+}
+
+set.seed(34)
+explainer <- lime(dat_train_scaled %>% select(-strength), model_rf)
+explanation <- explain(dat_test_scaled %>% select(-strength) %>% head(4), 
+                       explainer,
+                       n_features = 8,
+                       feature_select = "none"
+                       )
+
+plot_features(explanation)
+```
+
+A. Kasus 1:
+```{r}
+(0.496*rec$steps[[3]]$sds[["age"]] + rec$steps[[2]]$means[["age"]])^2
+```
+
+```{r}
+(0.393*rec$steps[[3]]$sds[["super_plast"]] + rec$steps[[2]]$means[["super_plast"]])^2
+```
+
+```{r}
+(-0.0252*rec$steps[[3]]$sds[["coarse_agg"]] + rec$steps[[2]]$means[["coarse_agg"]])^2
+```
+
+```{r}
+(0.7457*rec$steps[[3]]$sds[["coarse_agg"]] + rec$steps[[2]]$means[["coarse_agg"]])^2
+```
+Interpretasi Kasus 1:
+
+age > 55,98 hari memiliki bobot paling positif (korelasi positif) dalam kekuatan prediksi, sedangkan super_plast <= 6,69 memiliki bobot paling negatif (korelasi negatif) dalam kekuatan prediksi. coarse_agg berkisar antara 967,99 dan 1028,1 yang merupakan faktor yang paling tidak penting untuk kekuatan prediksi dalam kasus 1.
+
+
+
+B. Kasus 2:
+```{r}
+(0.496*rec$steps[[3]]$sds[["age"]] + rec$steps[[2]]$means[["age"]])^2
+```
+
+```{r}
+(0.536*rec$steps[[3]]$sds[["water"]] + rec$steps[[2]]$means[["water"]])^2
+```
+
+```{r}
+(-0.4984*rec$steps[[3]]$sds[["coarse_agg"]] + rec$steps[[2]]$means[["coarse_agg"]])^2
+```
+
+Interpretasi Kasus 2:
+
+age > 55,98 hari memiliki bobot paling positif (korelasi positif) dalam kekuatan prediksi, sedangkan water > 192.0096 memiliki bobot paling negatif (korelasi negatif) dalam kekuatan prediksi. coarse_agg <= 931,99 adalah faktor yang paling tidak penting untuk kekuatan dalam kasus 2.
+
+
+C. Kasus 3:
+```{r}
+(-0.8534*rec$steps[[3]]$sds[["cement"]] + rec$steps[[2]]$means[["cement"]])^2
+```
+```{r}
+(1.07*rec$steps[[3]]$sds[["flyash"]] + rec$steps[[2]]$means[["flyash"]])^2
+```
+
+```{r}
+(-0.868*rec$steps[[3]]$sds[["age"]] + rec$steps[[2]]$means[["age"]])^2
+```
+```{r}
+(-0.122*rec$steps[[3]]$sds[["age"]] + rec$steps[[2]]$means[["age"]])^2
+```
+Interpretasi Kasus 3:
+
+cement <= 190.69 memiliki bobot paling negatif (korelasi negatif) dalam kekuatan prediksi, sedangkan flyash <= 117.9146 memiliki bobot paling positif (korelasi positif) dalam kekuatan prediksi. age antara 7 dan 27,99 adalah faktor yang paling tidak penting untuk kekuatan dalam kasus 3.
+
+
+```{r}
+plot_explanations(explanation)
+```
+
+
+### Conclusion
+1. Apakah tujuan tercapai?
+
+Dalam kasus ini, tujuan pembentukan model adalah untuk mempredikasi kekuatan berdasarkan sifat sampuran dari mxiture properties seperti water age dll nya. Kinerja model terbaik yaitu Random Forest menghasilkan nilai MAE < 4 dan R-Squared > 90%. Berdasarkan tersebut, tujuan sudah tercapai dengan prediksi menggunakan model Random Forest.
+
+2. Apakah masalah ini dapat diselesaikan dengan machine learning?
+
+Tentu, masalah ini bisa diselesaikan dengan machine learning dalam bentuk model Random Forest. Sebelumnya sudah dicoba menggunakan model regresi dan di scaling, namun hasilnya belum sebaik Random Forest.
+
+3. Model apa yang dipakai dan bagaimana kinerjanya?
+
+Digunakan 2 percobaan model yaitu Model Regresi dan Model Random Forest. Berdasarkan hasil MAE dan R-Squared, model Random Forest adalah model yang terbaik dan saya pakai untuk model prediksi. Kinerjanya tentu baik karena Random Forest menghasilkan MAE=3.49614	dan R-Square=0.9445154 dimana angka tersebut sudah sangat baik. 
+
+4. Apa implementasi bisnis potensial dari capstone anda?
+
+Melalui interpretasi LIME, saya dapat mengetahui bahwa ketika age > 55.98 adalah bobot paling positif dalam memprediksi kekuatan yang artinya age > 55.98 lebih bagus untuk sifat campuran. 
+
+Kemudian, dengan menggunakan prediksi strength yang sudah saya coba dengan model Random Forest, maka bisa untuk mengoptimalkan harga jual bangunan pada sektor properti dan konstruksi seperti:
+
+a. Desain Struktur: Prediksi kekuatan beton membantu insinyur sipil dan desainer struktur dalam menghitung dimensi dan kapasitas beban yang dapat ditangani oleh struktur beton yang direncanakan.
+
+b. Evaluasi Kualitas Beton: Dengan membandingkan hasil prediksi dengan kekuatan tekan beton aktual yang diukur pada uji laboratorium, dapat dievaluasi kualitas beton yang digunakan dalam proyek konstruksi.
+
+c. Optimasi Campuran Beton: Hasil prediksi dapat digunakan untuk mengoptimalkan campuran beton dengan proporsi bahan tertentu sehingga mencapai kekuatan yang diinginkan.
+
+d. Perencanaan Anggaran: Dalam proyek konstruksi, prediksi kekuatan beton membantu dalam perencanaan anggaran dan sumber daya yang diperlukan.
+
+e. Evaluasi Ketahanan Struktur: Dalam pemeliharaan struktur beton yang ada, prediksi kekuatan beton membantu dalam menilai ketahanan struktur terhadap beban dan kondisi lingkungan.
+
+
